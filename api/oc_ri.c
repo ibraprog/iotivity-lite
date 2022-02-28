@@ -965,7 +965,7 @@ oc_ri_invoke_coap_entity_handler(void *request, void *response, uint8_t *buffer,
   }
 
   /* Obtain handle to buffer containing the serialized payload */
-  const uint8_t *payload = NULL;
+  uint8_t *payload = NULL;
   int payload_len = 0;
 #ifdef OC_BLOCK_WISE
   if (*request_state) {

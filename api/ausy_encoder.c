@@ -100,7 +100,7 @@ static CborError ausy_encode_value_2_cbor(json_value* value, CborEncoder* curren
     return err;
 }
 
-bool ausy_encode_payload_2_cbor(const uint8_t* payload,
+bool ausy_encode_payload_2_cbor(uint8_t* payload,
                                 const size_t payload_len,
                                 const oc_content_format_t cf)
 {
@@ -111,8 +111,7 @@ bool ausy_encode_payload_2_cbor(const uint8_t* payload,
         json_value* json_payload = json_parse(payload_string, payload_len);
         if (json_payload)
         {
-            //printf("Payload parsed successfully!\n");
-            //oc_rep_new(payload, payload_len);
+            OC_DBG("Payload parsed successfully!\n");
             CborEncoder encoder;
             cbor_encoder_init(&encoder, payload, payload_len, 0);
             CborError err = ausy_encode_value_2_cbor(json_payload, &encoder);
