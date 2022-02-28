@@ -3,7 +3,7 @@
 
 #include "oc_ri.h"
 
-bool ausy_encode_payload_2_cbor(const uint8_t* payload,
+bool ausy_encode_payload_2_cbor(uint8_t* payload,
                                 const size_t payload_len,
                                 const oc_content_format_t cf);
 
