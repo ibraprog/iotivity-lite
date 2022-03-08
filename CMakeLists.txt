@@ -123,6 +123,7 @@ endif()
 file(GLOB SERVER_SRC
     ${PROJECT_SOURCE_DIR}/messaging/coap/*.c
     ${PROJECT_SOURCE_DIR}/api/*.c
+    ${PROJECT_SOURCE_DIR}/api/ikea_gateway/*.c
 )
 
 set(CLIENT_SRC ${SERVER_SRC})
@@ -163,6 +164,8 @@ if(OC_CLOUD_ENABLED)
 endif()
 
 file(GLOB PYTHON_SRC python/*.c)
+file(GLOB IKEA_GTW_SRC ikea_gateway/*.C)
+set(IKEA_GTW_INCLUDE_DIR ${PROJECT_SOURCE_DIR}/api/ikea_gateway)
 
 ######## Define link dependencies ########
 set(PRIVATE_LINK_LIBS "")
@@ -200,21 +203,21 @@ target_include_directories(common-obj PRIVATE ${PROJECT_SOURCE_DIR} ${PROJECT_SO
 
 add_library(client-obj OBJECT ${CLIENT_SRC})
 target_compile_definitions(client-obj PRIVATE ${PRIVATE_COMPILE_DEFINITIONS} PUBLIC ${PUBLIC_COMPILE_DEFINITIONS} "OC_CLIENT")
-target_include_directories(client-obj PRIVATE ${PROJECT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/port ${PORT_INCLUDE_DIR})
+target_include_directories(client-obj PRIVATE ${PROJECT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/port ${PORT_INCLUDE_DIR} ${IKEA_GTW_INCLUDE_DIR})
 if(OC_SECURITY_ENABLED)
     target_include_directories(client-obj PRIVATE ${MBEDTLS_INCLUDE_DIRS})
 endif()
 
 add_library(server-obj OBJECT ${SERVER_SRC})
 target_compile_definitions(server-obj PRIVATE ${PRIVATE_COMPILE_DEFINITIONS} PUBLIC ${PUBLIC_COMPILE_DEFINITIONS} "OC_SERVER")
-target_include_directories(server-obj PRIVATE ${PROJECT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/port ${PORT_INCLUDE_DIR})
+target_include_directories(server-obj PRIVATE ${PROJECT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/port ${PORT_INCLUDE_DIR} ${IKEA_GTW_INCLUDE_DIR})
 if(OC_SECURITY_ENABLED)
     target_include_directories(server-obj PRIVATE ${MBEDTLS_INCLUDE_DIRS})
 endif()
 
 add_library(client-server-obj OBJECT ${CLIENT_SRC})
 target_compile_definitions(client-server-obj PRIVATE ${PRIVATE_COMPILE_DEFINITIONS} PUBLIC ${PUBLIC_COMPILE_DEFINITIONS} "OC_CLIENT" "OC_SERVER")
-target_include_directories(client-server-obj PRIVATE ${PROJECT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/port ${PORT_INCLUDE_DIR})
+target_include_directories(client-server-obj PRIVATE ${PROJECT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/port ${PORT_INCLUDE_DIR} ${IKEA_GTW_INCLUDE_DIR})
 if(OC_SECURITY_ENABLED)
     target_include_directories(client-server-obj PRIVATE ${MBEDTLS_INCLUDE_DIRS})
 endif()

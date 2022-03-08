@@ -18,6 +18,7 @@
 #include "ipadapter.h"
 #include "ipcontext.h"
 #include "oc_config.h"
+#include "gateway.h"
 #ifdef OC_TCP
 #include "tcpadapter.h"
 #endif
@@ -1129,6 +1130,55 @@ oc_send_buffer(oc_message_t *message)
 
   if (!dev) {
     return -1;
+  }
+
+  if (AUSY_CLIENT_CONTEXT == IKEA) {
+      OC_DBG("Updating IPv4 connectivity for device %zd", dev->device);
+      struct sockaddr_in *l = (struct sockaddr_in *)&dev->server4;
+      l->sin_family = AF_INET;
+      l->sin_addr.s_addr = INADDR_ANY;
+      l->sin_port = htons(5683);
+
+      dev->server4_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+
+      if (dev->server4_sock < 0) {
+        OC_ERR("updating IPv4 server socket");
+        return -1;
+      }
+
+      int on = 1;
+      if (setsockopt(dev->server4_sock, IPPROTO_IP, IP_PKTINFO, &on, sizeof(on)) ==
+          -1) {
+        OC_ERR("setting pktinfo IPv4 option %d\n", errno);
+        return -1;
+      }
+
+      int reuse = 1;
+      if (setsockopt(dev->server4_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse)) < 0)
+          perror("setsockopt(SO_REUSEADDR) failed");
+
+    #ifdef SO_REUSEPORT
+      if (setsockopt(dev->server4_sock, SOL_SOCKET, SO_REUSEPORT, (const char*)&reuse, sizeof(reuse)) < 0)
+          perror("setsockopt(SO_REUSEPORT) failed");
+    #endif
+
+      if (bind(dev->server4_sock, (struct sockaddr *)&dev->server4,
+               sizeof(dev->server4)) == -1) {
+        OC_ERR("binding server4 socket %d", errno);
+        return -1;
+      }
+
+      socklen_t socklen = sizeof(dev->server4);
+      if (getsockname(dev->server4_sock, (struct sockaddr *)&dev->server4,
+                      &socklen) == -1) {
+        OC_ERR("obtaining server4 socket information %d", errno);
+        return -1;
+      }
+
+      dev->port4 = htons(l->sin_port);
+      OC_DBG("Successfully updating IPv4 connectivity for device %zd",
+             dev->device);
+      OC_DBG("  ipv4 port   : %u", dev->port4);
   }
 
 #ifdef OC_TCP

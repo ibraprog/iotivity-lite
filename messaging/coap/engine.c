@@ -54,6 +54,7 @@
 #include "api/oc_main.h"
 #include "oc_api.h"
 #include "oc_buffer.h"
+#include "ausy_encoder.h"
 
 #ifdef OC_SECURITY
 #include "security/oc_audit.h"
@@ -878,6 +879,21 @@ init_reset_message:
 #endif /* OC_BLOCK_WISE */
 
 send_message:
+  /*{
+      oc_content_format_t cf = 0;
+      const int res = coap_get_header_content_format(response, &cf);
+      if (res && (cf == APPLICATION_CBOR || cf == APPLICATION_VND_OCF_CBOR)) {
+          OC_DBG("BEFORE: size = %u", response_buffer->payload_size);
+          const bool success = ausy_decode_response_from_cbor_2_text(response_buffer->buffer, response_buffer->buffer_size);
+          if (success) {
+              response_buffer->payload_size = strlen((char*)response_buffer->buffer);
+              OC_DBG("buffer: %s", (char*)response_buffer->buffer);
+              OC_DBG("AFTER: size = %u", response_buffer->payload_size);
+              coap_set_header_content_format(response, TEXT_PLAIN);
+          }
+      }
+  }*/
+
   if (coap_status_code == CLEAR_TRANSACTION) {
     coap_clear_transaction(transaction);
   } else if (transaction) {

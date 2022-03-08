@@ -125,3 +125,49 @@ bool ausy_encode_payload_2_cbor(uint8_t* payload,
     }
     return success;
 }
+
+bool ausy_decode_response_from_cbor_2_text(uint8_t* buffer,
+                                           uint32_t buffer_size)
+{
+    FILE* out = NULL;
+    CborValue cbor_value;
+    CborParser cbor_parser;
+    CborError err = cbor_parser_init(buffer, (size_t)buffer_size, 0, &cbor_parser, &cbor_value);
+    out = fopen("data.json", "w+");
+    if (!out) {
+        OC_ERR("data.json failed to open!\n");
+        return false;
+    } else {
+        //OC_DBG("data.json opened suscessfully!\n");
+        err |= cbor_value_to_json(out, &cbor_value, 0);
+        if (err == CborNoError) {
+            // Move the file pointer to the start.
+            fseek(out, 0, SEEK_SET);
+            /*char ch;
+            int i = 0;
+            do {
+                ch = fgetc(out);
+                if (ch == 39) {
+                    buffer[i] = 92;
+                    buffer[i+1] = 92;
+                    i += 2;
+                }
+                buffer[i] = ch;
+                i++;
+            } while (ch != EOF);*/
+            if (fgets(buffer,(int)buffer_size, out) != NULL) {
+             //OC_DBG("Decoded data = %s\n", str);
+                fclose(out);
+                return true;
+            } else {
+             OC_ERR("fgets return null ptr!\n");
+             fclose(out);
+             return false;
+            }
+        } else {
+            OC_ERR("Error when decoding the cbor data!\n");
+            fclose(out);
+            return false;
+        }
+    }
+}
