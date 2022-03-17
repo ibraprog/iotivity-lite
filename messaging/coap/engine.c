@@ -54,7 +54,8 @@
 #include "api/oc_main.h"
 #include "oc_api.h"
 #include "oc_buffer.h"
-#include "ausy_encoder.h"
+//#include "ausy_encoder.h"
+//#include "ausy_gateway.h"
 
 #ifdef OC_SECURITY
 #include "security/oc_audit.h"
@@ -329,6 +330,39 @@ coap_receive(oc_message_t *msg)
         }
       }
 
+
+    /*char** uri_array = NULL;
+    int uri_array_length = 0;
+    char* uri_path = strdup(message->uri_path);
+    const bool is_ikea_request = is_request_for_ikea_gateway(uri_path, uri_array, &uri_array_length);
+    free(uri_path);
+
+    if (is_ikea_request)
+    {
+        AUSY_CLIENT_CONTEXT = IKEA;
+        if (AUSY_GATEWAY != NULL) {
+            AUSY_GATEWAY->response_buffer = &response_buffer;
+            AUSY_GATEWAY->process = &ikea_process;
+            oc_status_t status = ikea_process(uri_array, uri_array_length);
+            if (status == OC_STATUS_OK)
+            {
+
+            }
+            else
+            {
+                OC_ERR("Ikea gateway processing failed!");
+            }
+        }
+
+        coap_send_empty_response(COAP_TYPE_ACK, message->mid, NULL, 0,
+                                 0, &msg->endpoint);
+
+        // free
+        free(uri_array);
+
+        //goto send_message;
+    }*/
+
       /* create transaction for response */
       transaction =
         coap_new_transaction(response->mid, NULL, 0, &msg->endpoint);
@@ -586,8 +620,8 @@ coap_receive(oc_message_t *msg)
 #ifdef OC_BLOCK_WISE
       request_handler:
         if (oc_ri_invoke_coap_entity_handler(message, response, &request_buffer,
-                                             &response_buffer, block2_size,
-                                             &msg->endpoint)) {
+                                                                      &response_buffer, block2_size,
+                                                                      &msg->endpoint)) {
 #else  /* OC_BLOCK_WISE */
         if (oc_ri_invoke_coap_entity_handler(message, response,
                                              transaction->message->data +
@@ -879,21 +913,6 @@ init_reset_message:
 #endif /* OC_BLOCK_WISE */
 
 send_message:
-  /*{
-      oc_content_format_t cf = 0;
-      const int res = coap_get_header_content_format(response, &cf);
-      if (res && (cf == APPLICATION_CBOR || cf == APPLICATION_VND_OCF_CBOR)) {
-          OC_DBG("BEFORE: size = %u", response_buffer->payload_size);
-          const bool success = ausy_decode_response_from_cbor_2_text(response_buffer->buffer, response_buffer->buffer_size);
-          if (success) {
-              response_buffer->payload_size = strlen((char*)response_buffer->buffer);
-              OC_DBG("buffer: %s", (char*)response_buffer->buffer);
-              OC_DBG("AFTER: size = %u", response_buffer->payload_size);
-              coap_set_header_content_format(response, TEXT_PLAIN);
-          }
-      }
-  }*/
-
   if (coap_status_code == CLEAR_TRANSACTION) {
     coap_clear_transaction(transaction);
   } else if (transaction) {

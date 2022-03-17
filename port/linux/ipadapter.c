@@ -18,7 +18,7 @@
 #include "ipadapter.h"
 #include "ipcontext.h"
 #include "oc_config.h"
-#include "gateway.h"
+#include "ausy_gateway.h"
 #ifdef OC_TCP
 #include "tcpadapter.h"
 #endif

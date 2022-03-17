@@ -24,7 +24,7 @@
 #include "util/oc_process.h"
 
 #include "ausy_encoder.h"
-#include "gateway.h"
+#include "ausy_gateway.h"
 
 #include "messaging/coap/constants.h"
 #include "messaging/coap/engine.h"
@@ -992,6 +992,7 @@ oc_ri_invoke_coap_entity_handler(void *request, void *response, uint8_t *buffer,
 #else  /* !OC_DYNAMIC_ALLOCATION */
   struct oc_memb rep_objects = { sizeof(oc_rep_t), 0, 0, 0, 0 };
 #endif /* OC_DYNAMIC_ALLOCATION */
+
   oc_rep_set_pool(&rep_objects);
 
   if (payload_len > 0)
@@ -1031,459 +1032,468 @@ oc_ri_invoke_coap_entity_handler(void *request, void *response, uint8_t *buffer,
       }
   }
 
-  char** uri_array = NULL;
+  oc_resource_t *resource, *cur_resource = NULL;
+
+  /* If there were no errors thus far, attempt to locate the specific
+   * resource object that will handle the request using the request uri.
+   */
+  /* Check against list of declared core resources.
+   */
+  if (!bad_request) {
+    int i;
+    for (i = 0; i < OC_NUM_CORE_RESOURCES_PER_DEVICE; i++) {
+      resource = oc_core_get_resource_by_index(i, endpoint->device);
+      if (oc_string_len(resource->uri) == (uri_path_len + 1) &&
+          strncmp((const char *)oc_string(resource->uri) + 1, uri_path,
+                  uri_path_len) == 0) {
+        request_obj.resource = cur_resource = resource;
+        break;
+      }
+    }
+  }
+
+#ifdef OC_SERVER
+  /* Check against list of declared application resources.
+   */
+  if (!cur_resource && !bad_request) {
+    request_obj.resource = cur_resource =
+      oc_ri_get_app_resource_by_uri(uri_path, uri_path_len, endpoint->device);
+
+#if defined(OC_COLLECTIONS)
+    if (cur_resource && oc_check_if_collection(cur_resource)) {
+      resource_is_collection = true;
+    }
+#endif /* OC_COLLECTIONS */
+  }
+#endif /* OC_SERVER */
+
+  if (cur_resource) {
+    /* If there was no interface selection, pick the "default interface". */
+    iface_mask = iface_query;
+    if (iface_mask == 0)
+      iface_mask = cur_resource->default_interface;
+
+    /* Found the matching resource object. Now verify that:
+     * 1) the selected interface is one that is supported by
+     *    the resource, and,
+     * 2) the selected interface supports the request method.
+     *
+     * If not, return a 4.00 response.
+     */
+    if (((iface_mask & ~cur_resource->interfaces) != 0) ||
+        !does_interface_support_method(iface_mask, method)) {
+      forbidden = true;
+      bad_request = true;
+#ifdef OC_SECURITY
+      oc_audit_log(endpoint->device, "COMM-1", "Operation not supported", 0x40,
+                   2, NULL, 0);
+#endif
+    }
+  }
+
+/* Alloc response_state. It also affects request_obj.response.
+ */
+#ifdef OC_BLOCK_WISE
+#ifdef OC_DYNAMIC_ALLOCATION
+  bool response_state_allocated = false;
+  bool enable_realloc_rep = false;
+#endif /* OC_DYNAMIC_ALLOCATION */
+  if (cur_resource && !bad_request) {
+    if (!(*response_state)) {
+      OC_DBG("creating new block-wise response state");
+      *response_state = oc_blockwise_alloc_response_buffer(
+        uri_path, uri_path_len, endpoint, method, OC_BLOCKWISE_SERVER,
+        OC_MIN_APP_DATA_SIZE);
+      if (!(*response_state)) {
+        OC_ERR("failure to alloc response state");
+        bad_request = true;
+      } else {
+#ifdef OC_DYNAMIC_ALLOCATION
+#ifdef OC_APP_DATA_BUFFER_POOL
+        if (!request_buffer->block)
+#endif /* OC_APP_DATA_BUFFER_POOL */
+        {
+          response_state_allocated = true;
+        }
+#endif /* OC_DYNAMIC_ALLOCATION */
+        if (uri_query_len > 0) {
+          oc_new_string(&(*response_state)->uri_query, uri_query,
+                        uri_query_len);
+        }
+        response_buffer.buffer = (*response_state)->buffer;
+        response_buffer.buffer_size = OC_MIN_APP_DATA_SIZE;
+      }
+    }
+  }
+#else  /* OC_BLOCK_WISE */
+  response_buffer.buffer = buffer;
+  response_buffer.buffer_size = OC_BLOCK_SIZE;
+#endif /* !OC_BLOCK_WISE */
+
+  if (cur_resource && !bad_request) {
+
+    /* Process a request against a valid resource, request payload, and
+     * interface.
+     */
+    /* Initialize oc_rep with a buffer to hold the response payload. "buffer"
+     * points to memory allocated in the messaging layer for the "CoAP
+     * Transaction" to service this request.
+     */
+#ifdef OC_DYNAMIC_ALLOCATION
+    if (response_state_allocated) {
+      oc_rep_new_realloc(&response_buffer.buffer, response_buffer.buffer_size,
+                         OC_MAX_APP_DATA_SIZE);
+      enable_realloc_rep = true;
+    } else {
+      oc_rep_new(response_buffer.buffer, response_buffer.buffer_size);
+    }
+#else  /* OC_DYNAMIC_ALLOCATION */
+    oc_rep_new(response_buffer.buffer, response_buffer.buffer_size);
+#endif /* !OC_DYNAMIC_ALLOCATION */
+
+#ifdef OC_SECURITY
+    /* If cur_resource is a coaps:// resource, then query ACL to check if
+     * the requestor (the subject) is authorized to issue this request to
+     * the resource.
+     */
+    if (!oc_sec_check_acl(method, cur_resource, endpoint)) {
+      authorized = false;
+      oc_ri_audit_log(method, cur_resource, endpoint);
+    } else
+#endif /* OC_SECURITY */
+    {
+/* If cur_resource is a collection resource, invoke the framework's
+ * internal handler for collections.
+ */
+#if defined(OC_COLLECTIONS) && defined(OC_SERVER)
+      if (resource_is_collection) {
+        if (!oc_handle_collection_request(method, &request_obj, iface_mask,
+                                          NULL)) {
+          OC_WRN("ocri: failed to handle collection request");
+          bad_request = true;
+        }
+      } else
+#endif /* OC_COLLECTIONS && OC_SERVER */
+        /* If cur_resource is a non-collection resource, invoke
+         * its handler for the requested method. If it has not
+         * implemented that method, then return a 4.05 response.
+         */
+        if (method == OC_GET && cur_resource->get_handler.cb) {
+        cur_resource->get_handler.cb(&request_obj, iface_mask,
+                                     cur_resource->get_handler.user_data);
+      } else if (method == OC_POST && cur_resource->post_handler.cb) {
+        cur_resource->post_handler.cb(&request_obj, iface_mask,
+                                      cur_resource->post_handler.user_data);
+      } else if (method == OC_PUT && cur_resource->put_handler.cb) {
+        cur_resource->put_handler.cb(&request_obj, iface_mask,
+                                     cur_resource->put_handler.user_data);
+      } else if (method == OC_DELETE && cur_resource->delete_handler.cb) {
+        cur_resource->delete_handler.cb(&request_obj, iface_mask,
+                                        cur_resource->delete_handler.user_data);
+      } else {
+        method_impl = false;
+      }
+    }
+  }
+
+  if (cf_original != APPLICATION_CBOR && cf_original != APPLICATION_VND_OCF_CBOR) {
+    //OC_DBG("BEFORE: size = %ld", response_buffer.response_length);
+    const bool success = ausy_decode_response_from_cbor_2_text(response_buffer.buffer,
+                                                               response_buffer.buffer_size);
+    if (success) {
+        response_buffer.response_length = strlen((char*)response_buffer.buffer);
+        //OC_DBG("buffer: %s", (char*)response_buffer.buffer);
+        //OC_DBG("AFTER: size = %ld", response_buffer.response_length);
+        response_buffer.content_format = cf_original;
+        coap_set_header_content_format(response, response_buffer.content_format);
+
+        // shrink encoder buffer
+        oc_rep_new(response_buffer.buffer, response_buffer.response_length);
+        OC_DBG("cbor encoder buffer was shrinked from %d to %d", (int)response_buffer.buffer_size,
+               (int)response_buffer.response_length);
+    }
+  }
+
+  /*char** uri_array = NULL;
   int uri_array_length = 0;
-  const bool is_ikea_request = is_request_for_ikea_gateway(uri_path, &uri_array, &uri_array_length);
-  
+  const bool is_ikea_request = is_request_for_ikea_gateway(uri_path, uri_array, &uri_array_length);
+
   if (is_ikea_request)
   {
       AUSY_CLIENT_CONTEXT = IKEA;
+      char* buf = "";
+      if (AUSY_GATEWAY != NULL) {
+          AUSY_GATEWAY->response_buffer = &response_buffer;
+          AUSY_GATEWAY->process = &ikea_process;
+          oc_status_t status = ikea_process(uri_array, uri_array_length);
+          if (status == OC_STATUS_OK)
+          {
+
+          }
+          else
+          {
+              OC_ERR("Ikea gateway processing failed!");
+          }
+      }
 
       // free uri_array
-      for (int i = 0; i < uri_array_length; i++) {
-          free(uri_array[i]);
-      }
       free(uri_array);
-  }
-  else 
-  { 
-      oc_resource_t *resource, *cur_resource = NULL;
-    
-      /* If there were no errors thus far, attempt to locate the specific
-       * resource object that will handle the request using the request uri.
-       */
-      /* Check against list of declared core resources.
-       */
-      if (!bad_request) {
-        int i;
-        for (i = 0; i < OC_NUM_CORE_RESOURCES_PER_DEVICE; i++) {
-          resource = oc_core_get_resource_by_index(i, endpoint->device);
-          if (oc_string_len(resource->uri) == (uri_path_len + 1) &&
-              strncmp((const char *)oc_string(resource->uri) + 1, uri_path,
-                      uri_path_len) == 0) {
-            request_obj.resource = cur_resource = resource;
-            break;
-          }
-        }
-      }
-    
-    #ifdef OC_SERVER
-      /* Check against list of declared application resources.
-       */
-      if (!cur_resource && !bad_request) {
-        request_obj.resource = cur_resource =
-          oc_ri_get_app_resource_by_uri(uri_path, uri_path_len, endpoint->device);
-    
-    #if defined(OC_COLLECTIONS)
-        if (cur_resource && oc_check_if_collection(cur_resource)) {
-          resource_is_collection = true;
-        }
-    #endif /* OC_COLLECTIONS */
-      }
-    #endif /* OC_SERVER */
-    
-      if (cur_resource) {
-        /* If there was no interface selection, pick the "default interface". */
-        iface_mask = iface_query;
-        if (iface_mask == 0)
-          iface_mask = cur_resource->default_interface;
-    
-        /* Found the matching resource object. Now verify that:
-         * 1) the selected interface is one that is supported by
-         *    the resource, and,
-         * 2) the selected interface supports the request method.
-         *
-         * If not, return a 4.00 response.
-         */
-        if (((iface_mask & ~cur_resource->interfaces) != 0) ||
-            !does_interface_support_method(iface_mask, method)) {
-          forbidden = true;
-          bad_request = true;
-    #ifdef OC_SECURITY
-          oc_audit_log(endpoint->device, "COMM-1", "Operation not supported", 0x40,
-                       2, NULL, 0);
-    #endif
-        }
-      }
-    
-    /* Alloc response_state. It also affects request_obj.response.
-     */
-    #ifdef OC_BLOCK_WISE
-    #ifdef OC_DYNAMIC_ALLOCATION
-      bool response_state_allocated = false;
-      bool enable_realloc_rep = false;
-    #endif /* OC_DYNAMIC_ALLOCATION */
-      if (cur_resource && !bad_request) {
-        if (!(*response_state)) {
-          OC_DBG("creating new block-wise response state");
-          *response_state = oc_blockwise_alloc_response_buffer(
-            uri_path, uri_path_len, endpoint, method, OC_BLOCKWISE_SERVER,
-            OC_MIN_APP_DATA_SIZE);
-          if (!(*response_state)) {
-            OC_ERR("failure to alloc response state");
-            bad_request = true;
-          } else {
-    #ifdef OC_DYNAMIC_ALLOCATION
-    #ifdef OC_APP_DATA_BUFFER_POOL
-            if (!request_buffer->block)
-    #endif /* OC_APP_DATA_BUFFER_POOL */
-            {
-              response_state_allocated = true;
-            }
-    #endif /* OC_DYNAMIC_ALLOCATION */
-            if (uri_query_len > 0) {
-              oc_new_string(&(*response_state)->uri_query, uri_query,
-                            uri_query_len);
-            }
-            response_buffer.buffer = (*response_state)->buffer;
-            response_buffer.buffer_size = OC_MIN_APP_DATA_SIZE;
-          }
-        }
-      }
-    #else  /* OC_BLOCK_WISE */
-      response_buffer.buffer = buffer;
-      response_buffer.buffer_size = OC_BLOCK_SIZE;
-    #endif /* !OC_BLOCK_WISE */
-    
-      if (cur_resource && !bad_request) {
-    
-        /* Process a request against a valid resource, request payload, and
-         * interface.
-         */
-        /* Initialize oc_rep with a buffer to hold the response payload. "buffer"
-         * points to memory allocated in the messaging layer for the "CoAP
-         * Transaction" to service this request.
-         */
-    #ifdef OC_DYNAMIC_ALLOCATION
-        if (response_state_allocated) {
-          oc_rep_new_realloc(&response_buffer.buffer, response_buffer.buffer_size,
-                             OC_MAX_APP_DATA_SIZE);
-          enable_realloc_rep = true;
-        } else {
-          oc_rep_new(response_buffer.buffer, response_buffer.buffer_size);
-        }
-    #else  /* OC_DYNAMIC_ALLOCATION */
-        oc_rep_new(response_buffer.buffer, response_buffer.buffer_size);
-    #endif /* !OC_DYNAMIC_ALLOCATION */
-    
-    #ifdef OC_SECURITY
-        /* If cur_resource is a coaps:// resource, then query ACL to check if
-         * the requestor (the subject) is authorized to issue this request to
-         * the resource.
-         */
-        if (!oc_sec_check_acl(method, cur_resource, endpoint)) {
-          authorized = false;
-          oc_ri_audit_log(method, cur_resource, endpoint);
-        } else
-    #endif /* OC_SECURITY */
-        {
-    /* If cur_resource is a collection resource, invoke the framework's
-     * internal handler for collections.
-     */
-    #if defined(OC_COLLECTIONS) && defined(OC_SERVER)
-          if (resource_is_collection) {
-            if (!oc_handle_collection_request(method, &request_obj, iface_mask,
-                                              NULL)) {
-              OC_WRN("ocri: failed to handle collection request");
-              bad_request = true;
-            }
-          } else
-    #endif /* OC_COLLECTIONS && OC_SERVER */
-            /* If cur_resource is a non-collection resource, invoke
-             * its handler for the requested method. If it has not
-             * implemented that method, then return a 4.05 response.
-             */
-            if (method == OC_GET && cur_resource->get_handler.cb) {
-            cur_resource->get_handler.cb(&request_obj, iface_mask,
-                                         cur_resource->get_handler.user_data);
-          } else if (method == OC_POST && cur_resource->post_handler.cb) {
-            cur_resource->post_handler.cb(&request_obj, iface_mask,
-                                          cur_resource->post_handler.user_data);
-          } else if (method == OC_PUT && cur_resource->put_handler.cb) {
-            cur_resource->put_handler.cb(&request_obj, iface_mask,
-                                         cur_resource->put_handler.user_data);
-          } else if (method == OC_DELETE && cur_resource->delete_handler.cb) {
-            cur_resource->delete_handler.cb(&request_obj, iface_mask,
-                                            cur_resource->delete_handler.user_data);
-          } else {
-            method_impl = false;
-          }
-        }
-      }
+  }*/
 
-    if (cf_original != APPLICATION_CBOR && cf_original != APPLICATION_VND_OCF_CBOR) {
-        //OC_DBG("BEFORE: size = %ld", response_buffer.response_length);
-        const bool success = ausy_decode_response_from_cbor_2_text(response_buffer.buffer,
-                                                                   response_buffer.buffer_size);
-        if (success) {
-            response_buffer.response_length = strlen((char*)response_buffer.buffer);
-            //OC_DBG("buffer: %s", (char*)response_buffer.buffer);
-            //OC_DBG("AFTER: size = %ld", response_buffer.response_length);
-            response_buffer.content_format = cf_original;
-            coap_set_header_content_format(response, response_buffer.content_format);
-
-            // shrink encoder buffer
-            oc_rep_new(response_buffer.buffer, response_buffer.response_length);
-            OC_DBG("cbor encoder buffer was shrinked from %d to %d", (int)response_buffer.buffer_size,
-                   (int)response_buffer.response_length);
-        }
+#if defined(OC_BLOCK_WISE)
+  oc_blockwise_free_request_buffer(*request_state);
+  *request_state = NULL;
+#ifdef OC_DYNAMIC_ALLOCATION
+  // for realloc we need reassign memory again.
+  if (enable_realloc_rep) {
+    response_buffer.buffer = oc_rep_shrink_encoder_buf(response_buffer.buffer);
+    if (response_state && (*response_state)) {
+      (*response_state)->buffer = response_buffer.buffer;
     }
-    
-    #if defined(OC_BLOCK_WISE)
-      oc_blockwise_free_request_buffer(*request_state);
-      *request_state = NULL;
-    #ifdef OC_DYNAMIC_ALLOCATION
-      // for realloc we need reassign memory again.
-      if (enable_realloc_rep) {
-        response_buffer.buffer = oc_rep_shrink_encoder_buf(response_buffer.buffer);
-        if (response_state && (*response_state)) {
-          (*response_state)->buffer = response_buffer.buffer;
-        }
-      }
-    #endif
-    #endif
-    
-      if (request_obj.request_payload) {
-        /* To the extent that the request payload was parsed, free the
-         * payload structure (and return its memory to the pool).
-         */
-        oc_free_rep(request_obj.request_payload);
-      }
-    
-      if (forbidden) {
-        OC_WRN("ocri: Forbidden request");
-        response_buffer.response_length = 0;
-        response_buffer.code = oc_status_code(OC_STATUS_FORBIDDEN);
-      } else if (entity_too_large) {
-        OC_WRN("ocri: Request payload too large (hence incomplete)");
-        response_buffer.response_length = 0;
-        response_buffer.code = oc_status_code(OC_STATUS_REQUEST_ENTITY_TOO_LARGE);
-      } else if (bad_request) {
-        OC_WRN("ocri: Bad request");
-        /* Return a 4.00 response */
-        response_buffer.response_length = 0;
-        response_buffer.code = oc_status_code(OC_STATUS_BAD_REQUEST);
-      } else if (!cur_resource) {
-        OC_WRN("ocri: Could not find resource");
-        /* Return a 4.04 response if the requested resource was not found */
-        response_buffer.response_length = 0;
-        response_buffer.code = oc_status_code(OC_STATUS_NOT_FOUND);
-      } else if (!method_impl) {
-        OC_WRN("ocri: Could not find method");
-        /* Return a 4.05 response if the resource does not implement the
-         * request method.
-         */
-        response_buffer.response_length = 0;
-        response_buffer.code = oc_status_code(OC_STATUS_METHOD_NOT_ALLOWED);
-      }
-    #ifdef OC_SECURITY
-      else if (!authorized) {
-        OC_WRN("ocri: Subject not authorized");
-        /* If the requestor (subject) does not have access granted via an
-         * access control entry in the ACL, then it is not authorized to
-         * access the resource. A 4.01 response is sent.
-         */
-        response_buffer.response_length = 0;
-        response_buffer.code = oc_status_code(OC_STATUS_UNAUTHORIZED);
-      }
-    #endif /* OC_SECURITY */
-      else {
-        success = true;
-      }
-    
-    #ifdef OC_SERVER
-      /* If a GET request was successfully processed, then check its
-       *  observe option.
+  }
+#endif
+#endif
+
+  if (request_obj.request_payload) {
+    /* To the extent that the request payload was parsed, free the
+     * payload structure (and return its memory to the pool).
+     */
+    oc_free_rep(request_obj.request_payload);
+  }
+
+  if (forbidden) {
+    OC_WRN("ocri: Forbidden request");
+    response_buffer.response_length = 0;
+    response_buffer.code = oc_status_code(OC_STATUS_FORBIDDEN);
+  } else if (entity_too_large) {
+    OC_WRN("ocri: Request payload too large (hence incomplete)");
+    response_buffer.response_length = 0;
+    response_buffer.code = oc_status_code(OC_STATUS_REQUEST_ENTITY_TOO_LARGE);
+  } else if (bad_request) {
+    OC_WRN("ocri: Bad request");
+    /* Return a 4.00 response */
+    response_buffer.response_length = 0;
+    response_buffer.code = oc_status_code(OC_STATUS_BAD_REQUEST);
+  } else if (!cur_resource) {
+    OC_WRN("ocri: Could not find resource");
+    /* Return a 4.04 response if the requested resource was not found */
+    response_buffer.response_length = 0;
+    response_buffer.code = oc_status_code(OC_STATUS_NOT_FOUND);
+  } else if (!method_impl) {
+    OC_WRN("ocri: Could not find method");
+    /* Return a 4.05 response if the resource does not implement the
+     * request method.
+     */
+    response_buffer.response_length = 0;
+    response_buffer.code = oc_status_code(OC_STATUS_METHOD_NOT_ALLOWED);
+  }
+#ifdef OC_SECURITY
+  else if (!authorized) {
+    OC_WRN("ocri: Subject not authorized");
+    /* If the requestor (subject) does not have access granted via an
+     * access control entry in the ACL, then it is not authorized to
+     * access the resource. A 4.01 response is sent.
+     */
+    response_buffer.response_length = 0;
+    response_buffer.code = oc_status_code(OC_STATUS_UNAUTHORIZED);
+  }
+#endif /* OC_SECURITY */
+  else {
+    success = true;
+  }
+
+#ifdef OC_SERVER
+  /* If a GET request was successfully processed, then check its
+   *  observe option.
+   */
+  uint32_t observe = 2;
+  if (success && response_buffer.code < oc_status_code(OC_STATUS_BAD_REQUEST) &&
+      coap_get_header_observe(request, &observe)) {
+    /* Check if the resource is OBSERVABLE */
+    if (cur_resource->properties & OC_OBSERVABLE) {
+      bool set_observe_option = true;
+      /* If the observe option is set to 0, make an attempt to add the
+       * requesting client as an observer.
        */
-      uint32_t observe = 2;
-      if (success && response_buffer.code < oc_status_code(OC_STATUS_BAD_REQUEST) &&
-          coap_get_header_observe(request, &observe)) {
-        /* Check if the resource is OBSERVABLE */
-        if (cur_resource->properties & OC_OBSERVABLE) {
-          bool set_observe_option = true;
-          /* If the observe option is set to 0, make an attempt to add the
-           * requesting client as an observer.
+      if (observe == 0) {
+#ifdef OC_BLOCK_WISE
+        if (coap_observe_handler(request, response, cur_resource, block2_size,
+                                 endpoint, iface_query) >= 0) {
+#else  /* OC_BLOCK_WISE */
+        if (coap_observe_handler(request, response, cur_resource, endpoint,
+                                 iface_query) >= 0) {
+#endif /* !OC_BLOCK_WISE */
+          /* If the resource is marked as periodic observable it means
+           * it must be polled internally for updates (which would lead to
+           * notifications being sent). If so, add the resource to a list of
+           * periodic GET callbacks to utilize the framework's internal
+           * polling mechanism.
            */
-          if (observe == 0) {
-    #ifdef OC_BLOCK_WISE
-            if (coap_observe_handler(request, response, cur_resource, block2_size,
-                                     endpoint, iface_query) >= 0) {
-    #else  /* OC_BLOCK_WISE */
-            if (coap_observe_handler(request, response, cur_resource, endpoint,
-                                     iface_query) >= 0) {
-    #endif /* !OC_BLOCK_WISE */
-              /* If the resource is marked as periodic observable it means
-               * it must be polled internally for updates (which would lead to
-               * notifications being sent). If so, add the resource to a list of
-               * periodic GET callbacks to utilize the framework's internal
-               * polling mechanism.
-               */
-              if (cur_resource->properties & OC_PERIODIC) {
-                if (!add_periodic_observe_callback(cur_resource)) {
-                  set_observe_option = false;
-                }
+          if (cur_resource->properties & OC_PERIODIC) {
+            if (!add_periodic_observe_callback(cur_resource)) {
+              set_observe_option = false;
+            }
+          }
+        }
+#if defined(OC_COLLECTIONS)
+        if (resource_is_collection) {
+          oc_collection_t *collection = (oc_collection_t *)cur_resource;
+          oc_link_t *links = (oc_link_t *)oc_list_head(collection->links);
+#ifdef OC_SECURITY
+          while (links) {
+            if (links->resource &&
+                (links->resource->properties & OC_OBSERVABLE)) {
+              if (!oc_sec_check_acl(OC_GET, links->resource, endpoint)) {
+                set_observe_option = false;
+                break;
               }
             }
-    #if defined(OC_COLLECTIONS)
-            if (resource_is_collection) {
-              oc_collection_t *collection = (oc_collection_t *)cur_resource;
-              oc_link_t *links = (oc_link_t *)oc_list_head(collection->links);
-    #ifdef OC_SECURITY
+            links = links->next;
+          }
+#endif /* OC_SECURITY */
+          if (set_observe_option) {
+            if (iface_query == OC_IF_B) {
+              links = (oc_link_t *)oc_list_head(collection->links);
               while (links) {
                 if (links->resource &&
-                    (links->resource->properties & OC_OBSERVABLE)) {
-                  if (!oc_sec_check_acl(OC_GET, links->resource, endpoint)) {
-                    set_observe_option = false;
-                    break;
-                  }
+                    (links->resource->properties & OC_PERIODIC)) {
+                  add_periodic_observe_callback(links->resource);
                 }
                 links = links->next;
               }
-    #endif /* OC_SECURITY */
-              if (set_observe_option) {
-                if (iface_query == OC_IF_B) {
-                  links = (oc_link_t *)oc_list_head(collection->links);
-                  while (links) {
-                    if (links->resource &&
-                        (links->resource->properties & OC_PERIODIC)) {
-                      add_periodic_observe_callback(links->resource);
-                    }
-                    links = links->next;
-                  }
-                }
-              }
-            }
-    #endif /* OC_COLLECTIONS */
-            if (set_observe_option) {
-              coap_set_header_observe(response, 0);
-            } else {
-              coap_remove_observer_by_token(endpoint, packet->token,
-                                            packet->token_len);
-            }
-          }
-          /* If the observe option is set to 1, make an attempt to remove
-           * the requesting client from the list of observers. In addition,
-           * remove the resource from the list periodic GET callbacks if it
-           * is periodic observable.
-           */
-          else if (observe == 1) {
-    #ifdef OC_BLOCK_WISE
-            if (coap_observe_handler(request, response, cur_resource, block2_size,
-                                     endpoint, iface_query) > 0) {
-    #else  /* OC_BLOCK_WISE */
-            if (coap_observe_handler(request, response, cur_resource, endpoint,
-                                     iface_query) > 0) {
-    #endif /* !OC_BLOCK_WISE */
-              if (cur_resource->properties & OC_PERIODIC) {
-                remove_periodic_observe_callback(cur_resource);
-              }
-    #if defined(OC_COLLECTIONS)
-              if (resource_is_collection) {
-                oc_collection_t *collection = (oc_collection_t *)cur_resource;
-                oc_link_t *links = (oc_link_t *)oc_list_head(collection->links);
-                while (links) {
-                  if (links->resource &&
-                      (links->resource->properties & OC_PERIODIC)) {
-                    remove_periodic_observe_callback(links->resource);
-                  }
-                  links = links->next;
-                }
-              }
-    #endif /* OC_COLLECTIONS */
             }
           }
         }
+#endif /* OC_COLLECTIONS */
+        if (set_observe_option) {
+          coap_set_header_observe(response, 0);
+        } else {
+          coap_remove_observer_by_token(endpoint, packet->token,
+                                        packet->token_len);
+        }
       }
-    #endif /* OC_SERVER */
-    
-      if (request_obj.origin && (request_obj.origin->flags & MULTICAST) &&
-          response_buffer.code >= oc_status_code(OC_STATUS_BAD_REQUEST)) {
-        response_buffer.code = OC_IGNORE;
-      }
-    
-    #ifdef OC_SERVER
-      /* The presence of a separate response handle here indicates a
-       * successful handling of the request by a slow resource.
+      /* If the observe option is set to 1, make an attempt to remove
+       * the requesting client from the list of observers. In addition,
+       * remove the resource from the list periodic GET callbacks if it
+       * is periodic observable.
        */
-      if (response_obj.separate_response != NULL) {
-    /* Attempt to register a client request to the separate response tracker
-     * and pass in the observe option (if present) or the value 2 as
-     * determined by the code block above. Values 0 and 1 result in their
-     * expected behaviors whereas 2 indicates an absence of an observe
-     * option and hence a one-off request.
-     * Following a successful registration, the separate response tracker
-     * is flagged as "active". In this way, the function that later executes
-     * out-of-band upon availability of the resource state knows it must
-     * send out a response with it.
-     */
-    #ifdef OC_BLOCK_WISE
-        if (coap_separate_accept(request, response_obj.separate_response, endpoint,
-                                 observe, block2_size) == 1)
-    #else  /* OC_BLOCK_WISE */
-        if (coap_separate_accept(request, response_obj.separate_response, endpoint,
-                                 observe) == 1)
-    #endif /* !OC_BLOCK_WISE */
-          response_obj.separate_response->active = 1;
-      } else
-    #endif /* OC_SERVER */
-        if (response_buffer.code == OC_IGNORE) {
-        /* If the server-side logic chooses to reject a request, it sends
-         * below a response code of IGNORE, which results in the messaging
-         * layer freeing the CoAP transaction associated with the request.
-         */
-        coap_status_code = CLEAR_TRANSACTION;
-      } else {
-    #ifdef OC_SERVER
-        /* If the recently handled request was a PUT/POST, it conceivably
-         * altered the resource state, so attempt to notify all observers
-         * of that resource with the change.
-         */
-        if (
-    #ifdef OC_COLLECTIONS
-          !resource_is_collection &&
-    #endif /* OC_COLLECTIONS */
-          cur_resource && (method == OC_PUT || method == OC_POST) &&
-          response_buffer.code < oc_status_code(OC_STATUS_BAD_REQUEST)) {
-          if ((iface_mask == OC_IF_STARTUP) ||
-              (iface_mask == OC_IF_STARTUP_REVERT)) {
-            oc_resource_defaults_data_t *resource_defaults_data =
-              oc_ri_alloc_resource_defaults();
-            resource_defaults_data->resource = cur_resource;
-            resource_defaults_data->iface_mask = iface_mask;
-            oc_ri_add_timed_event_callback_ticks(
-              resource_defaults_data,
-              &oc_observe_notification_resource_defaults_delayed, 0);
-          } else {
-            oc_notify_observers_delayed(cur_resource, 0);
+      else if (observe == 1) {
+#ifdef OC_BLOCK_WISE
+        if (coap_observe_handler(request, response, cur_resource, block2_size,
+                                 endpoint, iface_query) > 0) {
+#else  /* OC_BLOCK_WISE */
+        if (coap_observe_handler(request, response, cur_resource, endpoint,
+                                 iface_query) > 0) {
+#endif /* !OC_BLOCK_WISE */
+          if (cur_resource->properties & OC_PERIODIC) {
+            remove_periodic_observe_callback(cur_resource);
           }
-        }
-    
-    #endif /* OC_SERVER */
-        if (response_buffer.response_length > 0) {
-    #ifdef OC_BLOCK_WISE
-          (*response_state)->payload_size = response_buffer.response_length;
-    #else  /* OC_BLOCK_WISE */
-          coap_set_payload(response, response_buffer.buffer,
-                           response_buffer.response_length);
-    #endif /* !OC_BLOCK_WISE */
-          if (response_buffer.content_format > 0) {
-            coap_set_header_content_format(response,
-                                           response_buffer.content_format);
+#if defined(OC_COLLECTIONS)
+          if (resource_is_collection) {
+            oc_collection_t *collection = (oc_collection_t *)cur_resource;
+            oc_link_t *links = (oc_link_t *)oc_list_head(collection->links);
+            while (links) {
+              if (links->resource &&
+                  (links->resource->properties & OC_PERIODIC)) {
+                remove_periodic_observe_callback(links->resource);
+              }
+              links = links->next;
+            }
           }
+#endif /* OC_COLLECTIONS */
         }
-    
-        if (response_buffer.code ==
-            oc_status_code(OC_STATUS_REQUEST_ENTITY_TOO_LARGE)) {
-          coap_set_header_size1(response, OC_BLOCK_SIZE);
-        }
-    
-        /* response_buffer.code at this point contains a valid CoAP status
-         *  code.
-         */
-        coap_set_status_code(response, response_buffer.code);
       }
-      return success;
+    }
   }
+#endif /* OC_SERVER */
+
+  if (request_obj.origin && (request_obj.origin->flags & MULTICAST) &&
+      response_buffer.code >= oc_status_code(OC_STATUS_BAD_REQUEST)) {
+    response_buffer.code = OC_IGNORE;
+  }
+
+#ifdef OC_SERVER
+  /* The presence of a separate response handle here indicates a
+   * successful handling of the request by a slow resource.
+   */
+  if (response_obj.separate_response != NULL) {
+/* Attempt to register a client request to the separate response tracker
+ * and pass in the observe option (if present) or the value 2 as
+ * determined by the code block above. Values 0 and 1 result in their
+ * expected behaviors whereas 2 indicates an absence of an observe
+ * option and hence a one-off request.
+ * Following a successful registration, the separate response tracker
+ * is flagged as "active". In this way, the function that later executes
+ * out-of-band upon availability of the resource state knows it must
+ * send out a response with it.
+ */
+#ifdef OC_BLOCK_WISE
+    if (coap_separate_accept(request, response_obj.separate_response, endpoint,
+                             observe, block2_size) == 1)
+#else  /* OC_BLOCK_WISE */
+    if (coap_separate_accept(request, response_obj.separate_response, endpoint,
+                             observe) == 1)
+#endif /* !OC_BLOCK_WISE */
+      response_obj.separate_response->active = 1;
+  } else
+#endif /* OC_SERVER */
+    if (response_buffer.code == OC_IGNORE) {
+    /* If the server-side logic chooses to reject a request, it sends
+     * below a response code of IGNORE, which results in the messaging
+     * layer freeing the CoAP transaction associated with the request.
+     */
+    coap_status_code = CLEAR_TRANSACTION;
+  } else {
+#ifdef OC_SERVER
+    /* If the recently handled request was a PUT/POST, it conceivably
+     * altered the resource state, so attempt to notify all observers
+     * of that resource with the change.
+     */
+    if (
+#ifdef OC_COLLECTIONS
+      !resource_is_collection &&
+#endif /* OC_COLLECTIONS */
+      cur_resource && (method == OC_PUT || method == OC_POST) &&
+      response_buffer.code < oc_status_code(OC_STATUS_BAD_REQUEST)) {
+      if ((iface_mask == OC_IF_STARTUP) ||
+          (iface_mask == OC_IF_STARTUP_REVERT)) {
+        oc_resource_defaults_data_t *resource_defaults_data =
+          oc_ri_alloc_resource_defaults();
+        resource_defaults_data->resource = cur_resource;
+        resource_defaults_data->iface_mask = iface_mask;
+        oc_ri_add_timed_event_callback_ticks(
+          resource_defaults_data,
+          &oc_observe_notification_resource_defaults_delayed, 0);
+      } else {
+        oc_notify_observers_delayed(cur_resource, 0);
+      }
+    }
+
+#endif /* OC_SERVER */
+    if (response_buffer.response_length > 0) {
+#ifdef OC_BLOCK_WISE
+      (*response_state)->payload_size = response_buffer.response_length;
+#else  /* OC_BLOCK_WISE */
+      coap_set_payload(response, response_buffer.buffer,
+                       response_buffer.response_length);
+#endif /* !OC_BLOCK_WISE */
+      if (response_buffer.content_format > 0) {
+        coap_set_header_content_format(response,
+                                       response_buffer.content_format);
+      }
+    }
+
+    if (response_buffer.code ==
+        oc_status_code(OC_STATUS_REQUEST_ENTITY_TOO_LARGE)) {
+      coap_set_header_size1(response, OC_BLOCK_SIZE);
+    }
+
+    /* response_buffer.code at this point contains a valid CoAP status
+     *  code.
+     */
+    coap_set_status_code(response, response_buffer.code);
+  }
+  return success;
 }
 
 #ifdef OC_CLIENT

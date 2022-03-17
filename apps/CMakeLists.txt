@@ -1,6 +1,11 @@
 project(iotivity-lite-apps)
 
 if(UNIX)
+    add_executable(ausy_gateway
+        ${PROJECT_SOURCE_DIR}/ausy_gateway_app.c
+    )
+    target_link_libraries(ausy_gateway client-server-static)
+
     add_executable(simpleserver
         ${PROJECT_SOURCE_DIR}/simpleserver.c
     )
